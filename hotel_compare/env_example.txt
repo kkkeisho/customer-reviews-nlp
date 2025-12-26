@@ -1,0 +1,5 @@
+# Google Places API キー（必須）
+# 取得方法: https://console.cloud.google.com/apis/credentials
+# ホテル検索と観光地取得の両方に使用されます
+GOOGLE_PLACES_API_KEY=your_google_places_api_key_here
+

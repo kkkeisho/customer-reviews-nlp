@@ -9,6 +9,7 @@
 # Notes:
 # - Default mode uses a lightweight keyword-based classifier (fast, no model download).
 # - Optional mode uses HuggingFace zero-shot (BART MNLI) + sentiment pipeline (can be slow / needs model download).
+# - Alerting uses counts/rates (NOT zero-shot probabilities).
 
 import re
 import random
@@ -298,6 +299,12 @@ with st.sidebar:
     source_filter = st.multiselect("ソース", options=SOURCES, default=[])
     sentiment_filter = st.multiselect("感情", options=["POSITIVE", "NEGATIVE", "NEUTRAL"], default=[])
 
+    st.divider()
+    st.subheader("🚨 アラート設定（週次）")
+    lookback_weeks = st.slider("ベースライン（過去N週）", 2, 12, 4, 1)
+    z_threshold = st.slider("閾値（平均 + z×σ）", 0.5, 4.0, 2.0, 0.1)
+    min_events_week = st.slider("今週の最低イベント数（母数ガード）", 5, 100, 20, 1)
+
 
 @st.cache_data
 def build_reviews_df(n: int, seed: int) -> pd.DataFrame:
@@ -326,6 +333,15 @@ if hotel_filter:
     df = df[df["hotel_id"].isin(hotel_filter)]
 if source_filter:
     df = df[df["source"].isin(source_filter)]
+
+st.divider()
+st.subheader("分析：OTAごとの顧客層を見る")
+focus_source = st.selectbox(
+    "ドリルダウンしたいソース（任意）",
+    options=["(All)"] + SOURCES,
+    index=0,
+    help="ここで選ぶと、そのOTAのレビューだけ下に表示します。",
+)
 
 # Classify
 with st.spinner("分類中..."):
@@ -379,6 +395,98 @@ with right:
         st.bar_chart(grp.set_index("aspect"))
     else:
         st.info("データがありません。")
+
+st.divider()
+
+# ----------------------------
+# 7) Weekly Alerts (NEW)
+# ----------------------------
+st.subheader("🚨 週次アラート：アスペクト別 NEG率の異常検知（ホテル全体）")
+st.caption("設計思想：zero-shotのscoreは使わず、イベント件数とNEG率のトレンドで検知する。")
+
+if len(events):
+    ev = events.copy()
+    ev["date"] = pd.to_datetime(ev["date"], errors="coerce")
+
+    # Week start (Mon) as timestamp
+    # Period('W') is typically week ending Sunday; start_time gives Monday start.
+    ev["week"] = ev["date"].dt.to_period("W").apply(lambda p: p.start_time)
+
+    weekly = (
+        ev.groupby(["week", "aspect"])
+        .agg(
+            events_cnt=("review_id", "count"),
+            neg_cnt=("sentiment", lambda s: (s == "NEGATIVE").sum()),
+        )
+        .reset_index()
+    )
+    weekly["neg_rate"] = weekly["neg_cnt"] / weekly["events_cnt"]
+
+    # Show a quick trend table (optional but useful)
+    with st.expander("週次サマリ（確認用）", expanded=False):
+        show_weekly = weekly.copy()
+        show_weekly["neg_rate"] = (show_weekly["neg_rate"] * 100).round(1)
+        st.dataframe(show_weekly.sort_values(["week", "aspect"], ascending=[False, True]), width="stretch")
+
+    # Alert logic: current week vs lookback mean + z*std, with min sample guard
+    alerts = []
+    for aspect, g in weekly.groupby("aspect"):
+        g = g.sort_values("week")
+        if len(g) < (lookback_weeks + 1):
+            continue  # not enough history
+
+        curr = g.iloc[-1]
+        hist = g.iloc[-(lookback_weeks + 1) : -1]
+
+        mean = float(hist["neg_rate"].mean())
+        std = float(hist["neg_rate"].std(ddof=0))
+
+        if (
+            int(curr["events_cnt"]) >= int(min_events_week)
+            and std > 0
+            and float(curr["neg_rate"]) > mean + float(z_threshold) * std
+        ):
+            alerts.append(
+                {
+                    "week": pd.Timestamp(curr["week"]).date(),
+                    "aspect": aspect,
+                    "neg_rate_%": round(float(curr["neg_rate"]) * 100, 1),
+                    "baseline_%": round(mean * 100, 1),
+                    "delta_pp": round((float(curr["neg_rate"]) - mean) * 100, 1),
+                    "events_cnt": int(curr["events_cnt"]),
+                }
+            )
+
+    alerts_df = pd.DataFrame(alerts)
+
+    if len(alerts_df):
+        st.dataframe(alerts_df.sort_values(["delta_pp"], ascending=False), use_container_width=True)
+
+        st.markdown("**Evidence（今週×該当アスペクトのNEG例）**")
+        latest_week = ev["week"].max()
+
+        for _, a in alerts_df.sort_values(["delta_pp"], ascending=False).iterrows():
+            aspect = a["aspect"]
+            subset = ev[
+                (ev["week"] == latest_week)
+                & (ev["aspect"] == aspect)
+                & (ev["sentiment"] == "NEGATIVE")
+            ].copy()
+
+            subset = subset.sort_values(["aspect_confidence", "sentiment_confidence"], ascending=False)
+            subset = subset.head(5)
+
+            st.markdown(f"- **{aspect}**（今週NEG率 {a['neg_rate_%']}% / 通常 {a['baseline_%']}% / +{a['delta_pp']}pp, n={a['events_cnt']}）")
+            if len(subset):
+                st.dataframe(subset[["date", "source", "rating", "text"]], use_container_width=True)
+            else:
+                st.info("該当するNEG例が見つかりませんでした（フィルタ条件などを確認）。")
+    else:
+        st.success("今週のアラートはありません 🎉（条件：今週n≥{0} & 今週NEG率 > 過去{1}週平均 + {2}σ）".format(
+            min_events_week, lookback_weeks, z_threshold
+        ))
+else:
+    st.info("データがありません。")
 
 st.divider()
 
